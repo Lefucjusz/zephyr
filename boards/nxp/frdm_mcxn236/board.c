@@ -107,19 +107,17 @@ void board_early_init_hook(void)
 	DT_NODE_HAS_STATUS_OKAY(DT_NODELABEL(sai1)) || \
 	DT_NODE_HAS_STATUS_OKAY(DT_NODELABEL(micfil))
 	/* < Set up PLL1 */
-	const pll_setup_t pll1_Setup = {
-		.pllctrl = SCG_SPLLCTRL_SOURCE(1U) | SCG_SPLLCTRL_SELI(3U) |
-				 SCG_SPLLCTRL_SELP(1U),
-		.pllndiv = SCG_SPLLNDIV_NDIV(25U),
-		.pllpdiv = SCG_SPLLPDIV_PDIV(10U),
-		.pllmdiv = SCG_SPLLMDIV_MDIV(256U),
-		.pllRate = 24576000U
-	};
+	const pll_setup_t pll1_Setup = {.pllctrl = SCG_SPLLCTRL_SOURCE(1U) | SCG_SPLLCTRL_SELI(3U) |
+						   SCG_SPLLCTRL_SELP(1U),
+					.pllndiv = SCG_SPLLNDIV_NDIV(25U),
+					.pllpdiv = SCG_SPLLPDIV_PDIV(5U),
+					.pllmdiv = SCG_SPLLMDIV_MDIV(192U),
+					.pllRate = 36864000U};
 
 	/* Configure PLL1 to the desired values */
 	CLOCK_SetPLL1Freq(&pll1_Setup);
-	/* Set PLL1 CLK0 divider to value 2, then the clock is 12288000Hz. */
-	CLOCK_SetClkDiv(kCLOCK_DivPLL1Clk0, 2U);
+	/* Set PLL1 CLK0 divider to 1, then the clock is 36864000Hz. */
+	CLOCK_SetClkDiv(kCLOCK_DivPLL1Clk0, 1U);
 #endif
 
 #if DT_NODE_HAS_STATUS_OKAY(DT_NODELABEL(flexcomm0))
