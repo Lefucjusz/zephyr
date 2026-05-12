@@ -1,0 +1,21 @@
+# RPi Pico PIO I2S driver configuration options
+
+# Copyright (c) 2026 Marcin Lyda
+# SPDX-License-Identifier: Apache-2.0
+
+menuconfig I2S_RPI_PICO
+	bool "Raspberry Pi Pico PIO I2S driver"
+	default y
+	depends on DT_HAS_RASPBERRYPI_PICO_I2S_ENABLED
+	select PICOSDK_USE_PIO
+	select DMA
+	help
+	  Enable I2S support using PIO on Raspberry Pi Pico
+
+if I2S_RPI_PICO
+
+config I2S_RX_BLOCK_COUNT
+	int "RX queue length"
+	default 4
+
+endif # I2S_RPI_PICO
