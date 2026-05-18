@@ -19,16 +19,16 @@
 LOG_MODULE_REGISTER(i2s_rpi_pico, CONFIG_I2S_LOG_LEVEL);
 
 RPI_PICO_PIO_DEFINE_PROGRAM(i2s_tx, 0, 7, 
-            //     .wrap_target
-    0xf82e, //  0: set    x, 14           side 3
-    0x7001, //  1: out    pins, 1         side 2
-    0x1841, //  2: jmp    x--, 1          side 3
-    0x6001, //  3: out    pins, 1         side 0
-    0xe82e, //  4: set    x, 14           side 1
-    0x6001, //  5: out    pins, 1         side 0
-    0x0845, //  6: jmp    x--, 5          side 1
-    0x7001, //  7: out    pins, 1         side 2
-            //     .wrap
+		//     .wrap_target
+	0xb822, //  0: mov    x, y            side 3
+	0x7001, //  1: out    pins, 1         side 2
+	0x1841, //  2: jmp    x--, 1          side 3
+	0x6001, //  3: out    pins, 1         side 0
+	0xa822, //  4: mov    x, y            side 1
+	0x6001, //  5: out    pins, 1         side 0
+	0x0845, //  6: jmp    x--, 5          side 1
+	0x7001, //  7: out    pins, 1         side 2
+		//     .wrap
 );
 
 struct i2s_q_item
@@ -39,48 +39,48 @@ struct i2s_q_item
 
 struct i2s_dev_config
 {
-    const struct device *piodev;
-    const struct pinctrl_dev_config *pcfg;
+	const struct device *piodev;
+	const struct pinctrl_dev_config *pcfg;
 	uint32_t clock_pin_base;
 	uint32_t data_pin;
 };
 
 struct stream
 {
-    enum i2s_state state;
-    struct k_msgq *msgq;
-    struct i2s_config i2s_cfg;
-    const struct device *dev_dma;
-    uint32_t dma_channel;
-    struct dma_config dma_cfg;
+	enum i2s_state state;
+	struct k_msgq *msgq;
+	struct i2s_config i2s_cfg;
+	const struct device *dev_dma;
+	uint32_t dma_channel;
+	struct dma_config dma_cfg;
 	struct dma_block_config dma_block_cfg;
-    size_t sm;
-    void *mem_block;
+	size_t sm;
+	void *mem_block;
 	bool last_block;
 };
 
 struct i2s_dev_data
 {
-    struct stream tx;
+	struct stream tx;
 };
 
 static void stream_queue_drop(struct stream *strm)
 {
-    struct i2s_q_item item;
+	struct i2s_q_item item;
 
-    while (!k_msgq_get(strm->msgq, &item, K_NO_WAIT)) {
-        LOG_DBG("Dropping item from queue");
+	while (!k_msgq_get(strm->msgq, &item, K_NO_WAIT)) {
+		LOG_DBG("Dropping item from queue");
 		k_mem_slab_free(strm->i2s_cfg.mem_slab, item.mem_block);
-    }
+	}
 }
 
 static void pio_i2s_set_bclk(PIO pio, uint8_t sm, struct i2s_config *cfg)
 {
-    const uint32_t sysclk_freq = clock_get_hz(clk_sys);
-    const uint32_t bclk_freq = cfg->frame_clk_freq * cfg->channels * cfg->word_size;
-    const uint32_t divider = 256ULL * sysclk_freq / (2ULL * bclk_freq); // TODO magic numbers
+	const uint32_t sysclk_freq = clock_get_hz(clk_sys);
+	const uint32_t bclk_freq = cfg->frame_clk_freq * cfg->channels * cfg->word_size;
+	const uint32_t divider = 256ULL * sysclk_freq / (2ULL * bclk_freq); // TODO magic numbers
 
-    pio_sm_set_clkdiv_int_frac(pio, sm, divider >> 8U, divider & 0xFFU);
+	pio_sm_set_clkdiv_int_frac(pio, sm, divider >> 8U, divider & 0xFFU);
 }
 
 static int pio_i2s_tx_init(PIO pio, uint32_t sm, uint32_t data_pin, uint32_t clock_pin_base) 
@@ -94,28 +94,34 @@ static int pio_i2s_tx_init(PIO pio, uint32_t sm, uint32_t data_pin, uint32_t clo
 	}
 
 	offset = pio_add_program(pio, RPI_PICO_PIO_GET_PROGRAM(i2s_tx));
-	
+
 	cfg = pio_get_default_sm_config(); 
-    sm_config_set_out_shift(&cfg, false, true, SM_AUTOPULL_THRESHOLD);
-    sm_config_set_out_pins(&cfg, data_pin, 1);
-    sm_config_set_sideset(&cfg, SM_SIDESET_BIT_COUNT, false, false);
-    sm_config_set_sideset_pins(&cfg, clock_pin_base);
+	sm_config_set_out_shift(&cfg, false, true, SM_AUTOPULL_THRESHOLD);
+	sm_config_set_out_pins(&cfg, data_pin, 1);
+	sm_config_set_sideset(&cfg, SM_SIDESET_BIT_COUNT, false, false);
+	sm_config_set_sideset_pins(&cfg, clock_pin_base);
 	sm_config_set_wrap(&cfg, 
 				offset + RPI_PICO_PIO_GET_WRAP_TARGET(i2s_tx),
 				offset + RPI_PICO_PIO_GET_WRAP(i2s_tx));
 	pio_sm_set_pindirs_with_mask(pio, sm, pin_mask, pin_mask);
-    pio_sm_set_pins_with_mask(pio, sm, pin_mask, pin_mask);
+	pio_sm_set_pins_with_mask(pio, sm, pin_mask, pin_mask);
 	pio_gpio_init(pio, data_pin);
 	pio_gpio_init(pio, clock_pin_base);
 	pio_gpio_init(pio, clock_pin_base + 1);
-    pio_sm_init(pio, sm, offset, &cfg);
+	pio_sm_init(pio, sm, offset, &cfg);
 
-    return 0;
+	return 0;
+}
+
+static void pio_i2s_tx_set_word_size(PIO pio, uint32_t sm, uint8_t word_size)
+{
+	/* PIO program expects register Y to be initialized to word_size - 2 */
+	pio_sm_exec(pio, sm, pio_encode_set(pio_y, word_size - 2));
 }
 
 static int i2s_rpi_pico_initialize(const struct device *dev)
 {
-    const struct i2s_dev_config *dev_cfg = dev->config;
+	const struct i2s_dev_config *dev_cfg = dev->config;
 	struct i2s_dev_data *dev_data = dev->data;
 	PIO pio;
 	int ret;
@@ -136,16 +142,16 @@ static int i2s_rpi_pico_initialize(const struct device *dev)
 	dev_data->tx.dma_cfg.user_data = (void *)dev;
 	dev_data->tx.dma_cfg.dma_slot = RPI_PICO_DMA_DREQ_TO_SLOT(pio_get_dreq(pio, dev_data->tx.sm, true));
 
-    ret = pio_i2s_tx_init(pio, dev_data->tx.sm, dev_cfg->data_pin, dev_cfg->clock_pin_base);
-    if (ret < 0) {
-        LOG_ERR("pio_tx_init() failed: %d", ret);
+	ret = pio_i2s_tx_init(pio, dev_data->tx.sm, dev_cfg->data_pin, dev_cfg->clock_pin_base);
+	if (ret < 0) {
+		LOG_ERR("pio_tx_init() failed: %d", ret);
 		return ret;
-    }
+	}
 
 	ret = pinctrl_apply_state(dev_cfg->pcfg, PINCTRL_STATE_DEFAULT);
 	if (ret < 0) {
 		LOG_ERR("pinctrl_apply_state() failed: %d", ret);
-        return ret;
+		return ret;
 	}
 
 	ret = dma_config(dev_data->tx.dev_dma, dev_data->tx.dma_channel, &dev_data->tx.dma_cfg);
@@ -153,8 +159,6 @@ static int i2s_rpi_pico_initialize(const struct device *dev)
 		LOG_ERR("dma_config() failed: %d", ret);
 		return ret;
 	}
-
-	LOG_INF("%s initialized", dev->name);
 
 	return 0;
 }
@@ -189,7 +193,7 @@ static int reload_dma(struct stream *strm, void *src, void *dst, uint32_t size)
 	}
 
 	ret = dma_start(strm->dev_dma, strm->dma_channel);
-	
+
 	return ret;
 }
 
@@ -305,53 +309,62 @@ static void i2s_dma_tx_callback(const struct device *dma_dev, void *arg, uint32_
 
 static int i2s_rpi_pico_config(const struct device *dev, enum i2s_dir dir, const struct i2s_config *i2s_cfg)
 {
-    const struct i2s_dev_config *dev_cfg = dev->config;
+	const struct i2s_dev_config *dev_cfg = dev->config;
 	struct i2s_dev_data *dev_data = dev->data;
 	struct stream *strm;
-	// int ret;
-    PIO pio;
+	PIO pio;
 
 	if (dir == I2S_DIR_TX) {
 		strm = &dev_data->tx;
 	}
-    else {
-        LOG_ERR("Only tx direction supported");
-        return -ENOSYS;
-    }
+	else {
+		LOG_ERR("Only tx direction supported");
+		return -ENOSYS;
+	}
+
+	strm->i2s_cfg = *i2s_cfg;
 
 	if ((strm->state != I2S_STATE_NOT_READY) && (strm->state != I2S_STATE_READY)) {
 		LOG_ERR("Invalid state: %d", strm->state);
 		return -EINVAL;
 	}
 
-	if ((i2s_cfg->options & I2S_OPT_FRAME_CLK_TARGET) || (i2s_cfg->options & I2S_OPT_BIT_CLK_TARGET)) {
-        LOG_ERR("Target role not supported");
+	if ((strm->i2s_cfg.options & (I2S_OPT_FRAME_CLK_TARGET | I2S_OPT_BIT_CLK_TARGET)) != 0) {
+		LOG_ERR("Target role not supported");
 		return -ENOSYS;
 	}
 
-	if (i2s_cfg->frame_clk_freq == 0U) {
-		LOG_ERR("Invalid frame_clk_freq %u", i2s_cfg->frame_clk_freq);
+	if (strm->i2s_cfg.frame_clk_freq == 0) {
+		LOG_ERR("frame_clk_freq cannot be zero");
 		strm->state = I2S_STATE_NOT_READY;
 		return -EINVAL;
 	}
 
-    // if (i2s_cfg->word_size != 16U) {
-    //     return -ENOSYS;
-    // }
+	switch (strm->i2s_cfg.word_size) {
+		case 16:
+		case 32:
+			break;
+		case 24:
+			strm->i2s_cfg.word_size = 32; // 24-bit sample uses 32-bit frame length
+			break;
+		default:
+			LOG_ERR("word_size %u not supported", strm->i2s_cfg.word_size);
+			return -ENOSYS;
+	}
 
-    if ((i2s_cfg->format & I2S_FMT_DATA_FORMAT_MASK) != I2S_FMT_DATA_FORMAT_I2S) {
-        return -ENOSYS;
-    }
+	if ((strm->i2s_cfg.format & I2S_FMT_DATA_FORMAT_MASK) != I2S_FMT_DATA_FORMAT_I2S) {
+		LOG_ERR("Only I2S format supported");
+		return -ENOSYS;
+	}
 
-    // if ((i2s_cfg->format & I2S_FMT_CLK_FORMAT_MASK) == I2S_FMT_BIT_CLK_INV) {
-    //     LOG_ERR("Clock inversion not supported");
-    //     return -ENOSYS;
-    // }
+	if ((strm->i2s_cfg.format & (I2S_FMT_CLK_FORMAT_MASK | I2S_FMT_FRAME_CLK_INV)) != 0) {
+		LOG_ERR("Inverted clock polarity not supported");
+		return -ENOSYS;
+	}
 
-	memcpy(&strm->i2s_cfg, i2s_cfg, sizeof(struct i2s_config));
-
-    pio = pio_rpi_pico_get_pio(dev_cfg->piodev);
-    pio_i2s_set_bclk(pio, strm->sm, &strm->i2s_cfg);
+	pio = pio_rpi_pico_get_pio(dev_cfg->piodev);
+	pio_i2s_set_bclk(pio, strm->sm, &strm->i2s_cfg);
+	pio_i2s_tx_set_word_size(pio, strm->sm, strm->i2s_cfg.word_size);
 
 	strm->state = I2S_STATE_READY;
 
@@ -360,17 +373,17 @@ static int i2s_rpi_pico_config(const struct device *dev, enum i2s_dir dir, const
 
 const struct i2s_config *i2s_rpi_pico_config_get(const struct device *dev, enum i2s_dir dir)
 {
-    return NULL;
+	return NULL; // TODO
 }
 
 static int i2s_rpi_pico_read(const struct device *dev, void **mem_block, size_t *size)
 {
-    return -ENOTSUP;
+	return -ENOTSUP;
 }
 
 static int i2s_rpi_pico_write(const struct device *dev, void *mem_block, size_t size)
 {
-    struct i2s_dev_data *dev_data = dev->data;
+	struct i2s_dev_data *dev_data = dev->data;
 	struct stream *strm = &dev_data->tx;
 	struct i2s_q_item block;
 	int ret;
@@ -380,7 +393,7 @@ static int i2s_rpi_pico_write(const struct device *dev, void *mem_block, size_t 
 		return -EIO;
 	}
 
-    if (size > strm->i2s_cfg.block_size) {
+	if (size > strm->i2s_cfg.block_size) {
 		LOG_ERR("Max write size is %uB", strm->i2s_cfg.block_size);
 		return -EINVAL;
 	}
@@ -399,10 +412,10 @@ static int i2s_rpi_pico_write(const struct device *dev, void *mem_block, size_t 
 
 static int i2s_rpi_pico_trigger(const struct device *dev, enum i2s_dir dir, enum i2s_trigger_cmd cmd)
 {
-    struct i2s_dev_data *dev_data = dev->data;
+	struct i2s_dev_data *dev_data = dev->data;
 	struct stream *strm = &dev_data->tx;
+	int ret = 0;
 	unsigned int key;
-	int ret;
 
 	// TODO DIR_BOTH
 
@@ -410,7 +423,7 @@ static int i2s_rpi_pico_trigger(const struct device *dev, enum i2s_dir dir, enum
 
 	switch (cmd) {
 	case I2S_TRIGGER_START:
-        if (strm->state != I2S_STATE_READY) {
+		if (strm->state != I2S_STATE_READY) {
 			LOG_ERR("START trigger: invalid state %d", strm->state);
 			ret = -EIO;
 			break;
@@ -425,7 +438,7 @@ static int i2s_rpi_pico_trigger(const struct device *dev, enum i2s_dir dir, enum
 		break;
 
 	case I2S_TRIGGER_STOP:
-        if (strm->state != I2S_STATE_RUNNING) {
+		if (strm->state != I2S_STATE_RUNNING) {
 			LOG_ERR("STOP trigger: invalid state %d", strm->state);
 			ret = -EIO;
 			break;
@@ -435,7 +448,7 @@ static int i2s_rpi_pico_trigger(const struct device *dev, enum i2s_dir dir, enum
 		break;
 
 	case I2S_TRIGGER_DRAIN:
-        if (strm->state != I2S_STATE_RUNNING) {
+		if (strm->state != I2S_STATE_RUNNING) {
 			LOG_ERR("DRAIN trigger: invalid state %d", strm->state);
 			ret = -EIO;
 			break;
@@ -444,7 +457,7 @@ static int i2s_rpi_pico_trigger(const struct device *dev, enum i2s_dir dir, enum
 		break;
 
 	case I2S_TRIGGER_DROP:
-        if (strm->state == I2S_STATE_NOT_READY) {
+		if (strm->state == I2S_STATE_NOT_READY) {
 			LOG_ERR("DROP trigger: invalid state %d", strm->state);
 			ret = -EIO;
 			break;
@@ -455,7 +468,7 @@ static int i2s_rpi_pico_trigger(const struct device *dev, enum i2s_dir dir, enum
 		break;
 
 	case I2S_TRIGGER_PREPARE:
-        if (strm->state != I2S_STATE_ERROR) {
+		if (strm->state != I2S_STATE_ERROR) {
 			LOG_ERR("PREPARE trigger: invalid state %d", strm->state);
 			ret = -EIO;
 			break;
@@ -473,7 +486,7 @@ static int i2s_rpi_pico_trigger(const struct device *dev, enum i2s_dir dir, enum
 
 	irq_unlock(key);
 
-	return 0;
+	return ret;
 }
 
 static DEVICE_API(i2s, i2s_rpi_pico_driver_api) = {
@@ -484,40 +497,40 @@ static DEVICE_API(i2s, i2s_rpi_pico_driver_api) = {
 	.trigger = i2s_rpi_pico_trigger,
 };
 
-#define I2S_RPI_PICO_INIT(inst)                                            \
-    PINCTRL_DT_INST_DEFINE(inst);                                          \
-                                                                            \
-    static const struct i2s_dev_config i2s##inst##_dev_config = {          \
-        .piodev = DEVICE_DT_GET(DT_INST_PARENT(inst)),					    \
-		.pcfg = PINCTRL_DT_INST_DEV_CONFIG_GET(inst),					    \
+#define I2S_RPI_PICO_INIT(inst)										\
+	PINCTRL_DT_INST_DEFINE(inst);									\
+													\
+	static const struct i2s_dev_config i2s##inst##_dev_config = {					\
+		.piodev = DEVICE_DT_GET(DT_INST_PARENT(inst)),						\
+		.pcfg = PINCTRL_DT_INST_DEV_CONFIG_GET(inst),						\
 		.clock_pin_base = DT_INST_RPI_PICO_PIO_PIN_BY_NAME(inst, default, 0, tx_pins, 0),	\
-		.data_pin = DT_INST_RPI_PICO_PIO_PIN_BY_NAME(inst, default, 0, tx_pins, 1),	\
-    };                                                                      \
-                                                                            \
-    K_MSGQ_DEFINE(i2s##inst##_tx_queue, sizeof(struct i2s_q_item),         \
-                    CONFIG_I2S_RX_BLOCK_COUNT, 4);	                        \
-                                                                            \
-    static struct i2s_dev_data i2s##inst##_dev_data = {                    \
-        .tx = {                                                             \
-            .msgq = &i2s##inst##_tx_queue,                                 \
-			.dev_dma = DEVICE_DT_GET(DT_INST_DMAS_CTLR_BY_NAME(inst, tx)),	\
-			.dma_channel = DT_INST_DMAS_CELL_BY_NAME(inst, tx, channel),   \
-			.dma_cfg = {							                        \
-                .source_burst_length = 1,                                   \
-                .dest_burst_length = 1,                                     \
-                .dma_callback = i2s_dma_tx_callback,               			\
-				.block_count = 1, 	                                        \
-                .head_block = &i2s##inst##_dev_data.tx.dma_block_cfg,      \
-				.channel_direction = MEMORY_TO_PERIPHERAL,		            \
-				.source_data_size = 4,  /* TODO configurable */		        \
-				.dest_data_size = 4,    /* TODO configurable */		        \
-			},								                                \
-        },                                                                  \
-    };				                                                        \
-                                                                            \
-    DEVICE_DT_INST_DEFINE(inst, i2s_rpi_pico_initialize, NULL,             \
-                  &i2s##inst##_dev_data, &i2s##inst##_dev_config,         \
-                  POST_KERNEL, CONFIG_I2S_INIT_PRIORITY,                    \
-                  &i2s_rpi_pico_driver_api);
+		.data_pin = DT_INST_RPI_PICO_PIO_PIN_BY_NAME(inst, default, 0, tx_pins, 1),		\
+	};												\
+													\
+	K_MSGQ_DEFINE(i2s##inst##_tx_queue, sizeof(struct i2s_q_item),					\
+			CONFIG_I2S_RX_BLOCK_COUNT, 4);							\
+													\
+	static struct i2s_dev_data i2s##inst##_dev_data = {						\
+		.tx = {											\
+			.msgq = &i2s##inst##_tx_queue,							\
+			.dev_dma = DEVICE_DT_GET(DT_INST_DMAS_CTLR_BY_NAME(inst, tx)),			\
+			.dma_channel = DT_INST_DMAS_CELL_BY_NAME(inst, tx, channel),			\
+			.dma_cfg = {									\
+				.source_burst_length = 1,                                   		\
+				.dest_burst_length = 1,                                     		\
+				.dma_callback = i2s_dma_tx_callback,               			\
+				.block_count = 1,							\
+				.head_block = &i2s##inst##_dev_data.tx.dma_block_cfg,			\
+				.channel_direction = MEMORY_TO_PERIPHERAL,				\
+				.source_data_size = 4,  /* TODO configurable */				\
+				.dest_data_size = 4,    /* TODO configurable */				\
+			},										\
+		},											\
+	};												\
+													\
+	DEVICE_DT_INST_DEFINE(inst, i2s_rpi_pico_initialize, NULL,					\
+			&i2s##inst##_dev_data, &i2s##inst##_dev_config,					\
+			POST_KERNEL, CONFIG_I2S_INIT_PRIORITY,						\
+			&i2s_rpi_pico_driver_api);
 
 DT_INST_FOREACH_STATUS_OKAY(I2S_RPI_PICO_INIT)
