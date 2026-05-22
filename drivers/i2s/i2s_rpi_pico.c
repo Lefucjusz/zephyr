@@ -11,25 +11,30 @@
 #include <zephyr/dt-bindings/dma/rpi-pico-dma-rp2350.h>
 #endif
 
+LOG_MODULE_REGISTER(i2s_rpi_pico, CONFIG_I2S_LOG_LEVEL);
+
 #define DT_DRV_COMPAT raspberrypi_pico_i2s
 
 #define SM_SIDESET_BIT_COUNT 2
 #define SM_AUTOPULL_THRESHOLD 32
 
-#define I2S_MCLK_TO_FS_RATIO 256
+#define PIO_CLKDIV_FRAC_BITS 8
+#define PIO_CLKDIV_FRAC_BASE (1U << PIO_CLKDIV_FRAC_BITS)
 
-LOG_MODULE_REGISTER(i2s_rpi_pico, CONFIG_I2S_LOG_LEVEL);
+#define I2S_MCLK_TO_FS_RATIO 256U
+
+#define PIO_I2S_TX_PROGRAM_RIGHT_ENTRY_POINT 4
 
 RPI_PICO_PIO_DEFINE_PROGRAM(i2s_tx, 0, 7, 
 		//     .wrap_target
-	0xb822, //  0: mov    x, y            side 3
-	0x7001, //  1: out    pins, 1         side 2
-	0x1841, //  2: jmp    x--, 1          side 3
-	0x6001, //  3: out    pins, 1         side 0
-	0xa822, //  4: mov    x, y            side 1
-	0x6001, //  5: out    pins, 1         side 0
-	0x0845, //  6: jmp    x--, 5          side 1
-	0x7001, //  7: out    pins, 1         side 2
+	0xa822, //  0: mov    x, y            side 1
+	0x6001, //  1: out    pins, 1         side 0
+	0x0841, //  2: jmp    x--, 1          side 1
+	0x7001, //  3: out    pins, 1         side 2
+	0xb822, //  4: mov    x, y            side 3
+	0x7001, //  5: out    pins, 1         side 2
+	0x1845, //  6: jmp    x--, 5          side 3
+	0x6001, //  7: out    pins, 1         side 0
 		//     .wrap
 );
 
@@ -50,7 +55,7 @@ struct i2s_dev_config
 {
 	const struct device *piodev;
 	const struct pinctrl_dev_config *pcfg;
-	uint32_t clock_pin_base;
+	uint32_t clk_pin_base;
 	uint32_t data_pin;
 	uint32_t mclk_pin;
 };
@@ -65,7 +70,7 @@ struct stream
 	struct dma_config dma_cfg;
 	struct dma_block_config dma_block_cfg;
 	size_t sm;
-	size_t mclk_sm; // TODO this should not be here
+	uint32_t sm_offset;
 	void *mem_block;
 	bool last_block;
 };
@@ -73,6 +78,7 @@ struct stream
 struct i2s_dev_data
 {
 	struct stream tx;
+	size_t mclk_sm;
 };
 
 static void stream_queue_drop(struct stream *strm)
@@ -85,85 +91,66 @@ static void stream_queue_drop(struct stream *strm)
 	}
 }
 
-// static void pio_i2s_set_bclk(PIO pio, uint8_t sm, struct i2s_config *cfg) // TODO
-// {
-// 	const uint32_t sysclk_freq = clock_get_hz(clk_sys);
-// 	const uint32_t bclk_freq = cfg->frame_clk_freq * cfg->channels * cfg->word_size;
-// 	const uint32_t divider = 256ULL * sysclk_freq / (2ULL * bclk_freq); // TODO magic numbers
-
-// 	pio_sm_set_clkdiv_int_frac(pio, sm, divider >> 8U, divider & 0xFFU);
-// }
-
-static uint64_t div_round(uint64_t n, uint64_t d)
-{
-	return (n + (d / 2)) / d;
-}
-
 static int pio_i2s_set_clocks(PIO pio, uint8_t mclk_sm, uint8_t tx_sm, struct i2s_config *cfg)
 {
-	const uint64_t mclk_sm_freq = 2ULL * I2S_MCLK_TO_FS_RATIO * cfg->frame_clk_freq;
-	const uint64_t bclk_sm_freq = 2ULL * cfg->frame_clk_freq * cfg->channels * cfg->word_size;
-	LOG_DBG("mclk_sm_freq: %lluHz", mclk_sm_freq);
-	LOG_DBG("bclk_sm_freq: %lluHz", bclk_sm_freq);
-
-	const uint32_t sysclk_freq = clock_get_hz(clk_sys);
+	const uint32_t mclk_sm_freq = 2U * I2S_MCLK_TO_FS_RATIO * cfg->frame_clk_freq;
+	const uint32_t bclk_sm_freq = 2U * cfg->frame_clk_freq * cfg->channels * cfg->word_size;
+	LOG_DBG("mclk_sm_freq: %" PRIu32 "Hz", mclk_sm_freq);
+	LOG_DBG("bclk_sm_freq: %" PRIu32 "Hz", bclk_sm_freq);
 
 	/* Compute MCLK SM divider in 16.8 */
-	const uint32_t mclk_div_q = div_round(256ULL * sysclk_freq, mclk_sm_freq); // TODO magic number
-	LOG_DBG("mclk_div_q: %u", mclk_div_q);
+	const uint64_t sysclk_freq = clock_get_hz(clk_sys);
+	const uint32_t mclk_div_q = DIV_ROUND_CLOSEST(PIO_CLKDIV_FRAC_BASE * sysclk_freq, mclk_sm_freq);
+	LOG_DBG("mclk_div_q: %" PRIu32, mclk_div_q);
 
 	/* Compute BCLK SM divider using BCLK to MCLK ratio */
-	const uint32_t bclk_div_q = mclk_div_q * mclk_sm_freq / bclk_sm_freq; // TODO work on cancelled out expression
-	LOG_DBG("bclk_div_q: %u", bclk_div_q);
+	const uint32_t bclk_div_q = (uint64_t)mclk_div_q * mclk_sm_freq / bclk_sm_freq;
+	LOG_DBG("bclk_div_q: %" PRIu32, bclk_div_q);
 
 	/* Check if the ratio is exact */
 	if ((mclk_div_q * I2S_MCLK_TO_FS_RATIO) != (bclk_div_q * cfg->channels * cfg->word_size)) {
 		return -EINVAL;
 	}
-	else {
-		LOG_DBG("Ratio is exact, expected %f, got %f", (float)mclk_sm_freq / bclk_sm_freq, (float)bclk_div_q / mclk_div_q);
-	}
 
 	/* Set clocks */
-	pio_sm_set_clkdiv_int_frac(pio, mclk_sm, mclk_div_q >> 8U, mclk_div_q & 0xFFU); // TODO add U where needed
-	pio_sm_set_clkdiv_int_frac(pio, tx_sm, bclk_div_q >> 8U, bclk_div_q & 0xFFU);
+	// pio_sm_set_clkdiv_int_frac(pio, mclk_sm, mclk_div_q >> 8, mclk_div_q & 0xFF);
+	// pio_sm_set_clkdiv_int_frac(pio, tx_sm, bclk_div_q >> 8, bclk_div_q & 0xFF);
+	pio_sm_set_clkdiv(pio, tx_sm, (float)sysclk_freq / bclk_sm_freq);
 
 	return 0;
 }
 
-static int pio_i2s_tx_init(PIO pio, uint32_t sm, uint32_t data_pin, uint32_t clock_pin_base) 
+static int pio_i2s_tx_init(PIO pio, uint32_t sm, uint32_t *offset, uint32_t data_pin, uint32_t clk_pin_base)
 {
-	const uint32_t pin_mask = (1U << data_pin) | (3U << clock_pin_base);
-	uint32_t offset;
 	pio_sm_config cfg;
 
 	if (!pio_can_add_program(pio, RPI_PICO_PIO_GET_PROGRAM(i2s_tx))) {
 		return -EBUSY;
 	}
 
-	offset = pio_add_program(pio, RPI_PICO_PIO_GET_PROGRAM(i2s_tx));
+	*offset = pio_add_program(pio, RPI_PICO_PIO_GET_PROGRAM(i2s_tx));
+
+	pio_gpio_init(pio, data_pin);
+	pio_gpio_init(pio, clk_pin_base);
+	pio_gpio_init(pio, clk_pin_base + 1); // TODO should be done by pinctrl?
 
 	cfg = pio_get_default_sm_config(); 
 	sm_config_set_out_shift(&cfg, false, true, SM_AUTOPULL_THRESHOLD);
 	sm_config_set_out_pins(&cfg, data_pin, 1);
+	sm_config_set_sideset_pins(&cfg, clk_pin_base);
 	sm_config_set_sideset(&cfg, SM_SIDESET_BIT_COUNT, false, false);
-	sm_config_set_sideset_pins(&cfg, clock_pin_base);
 	sm_config_set_wrap(&cfg, 
-				offset + RPI_PICO_PIO_GET_WRAP_TARGET(i2s_tx),
-				offset + RPI_PICO_PIO_GET_WRAP(i2s_tx));
-	pio_sm_set_pindirs_with_mask(pio, sm, pin_mask, pin_mask);
-	pio_sm_set_pins_with_mask(pio, sm, 0, pin_mask);
-	pio_gpio_init(pio, data_pin);
-	pio_gpio_init(pio, clock_pin_base);
-	pio_gpio_init(pio, clock_pin_base + 1);
-	pio_sm_init(pio, sm, offset, &cfg);
+				*offset + RPI_PICO_PIO_GET_WRAP_TARGET(i2s_tx),
+				*offset + RPI_PICO_PIO_GET_WRAP(i2s_tx));
+	pio_sm_init(pio, sm, *offset, &cfg);
+	pio_sm_set_consecutive_pindirs(pio, sm, data_pin, 1, true);
+	pio_sm_set_consecutive_pindirs(pio, sm, clk_pin_base, 2, true);
 
 	return 0;
 }
 
 static int pio_i2s_mclk_init(PIO pio, uint32_t sm, uint32_t mclk_pin)
 {
-	const uint32_t pin_mask = (1U << mclk_pin);
 	uint32_t offset;
 	pio_sm_config cfg;
 
@@ -172,22 +159,39 @@ static int pio_i2s_mclk_init(PIO pio, uint32_t sm, uint32_t mclk_pin)
 	}
 
 	offset = pio_add_program(pio, RPI_PICO_PIO_GET_PROGRAM(i2s_mclk));
+
+	pio_gpio_init(pio, mclk_pin); // TODO should be done by pinctrl?
+
 	sm_config_set_set_pins(&cfg, mclk_pin, 1);
 	sm_config_set_wrap(&cfg,
 				offset + RPI_PICO_PIO_GET_WRAP_TARGET(i2s_mclk),
 				offset + RPI_PICO_PIO_GET_WRAP(i2s_mclk));
-	pio_sm_set_pindirs_with_mask(pio, sm, pin_mask, pin_mask);
-	pio_sm_set_pins_with_mask(pio, sm, 0, pin_mask);
-	pio_gpio_init(pio, mclk_pin);
 	pio_sm_init(pio, sm, offset, &cfg);
+	pio_sm_set_consecutive_pindirs(pio, sm, mclk_pin, 1, true);
 
 	return 0;
 }
 
-static void pio_i2s_tx_set_word_size(PIO pio, uint32_t sm, uint8_t word_size)
+static void pio_i2s_tx_set_word_size(PIO pio, uint32_t sm, uint32_t sm_offset, uint8_t word_size)
 {
 	/* PIO program expects register Y to be initialized to word_size - 2 */
 	pio_sm_exec(pio, sm, pio_encode_set(pio_y, word_size - 2));
+
+	/* A trick to handle both 16-bit samples packed in 32-bit word and "proper"
+	 * 32-bit samples using one PIO program.
+	 * The samples are in LRLR... order in the buffer. It means that for 32-bit
+	 * width the first sample that will be transmitted will be the left one,
+	 * but for 16-bit the one at the MSB half-word will be the right one.
+	 * To avoid the channels being swapped in that case, start execution from
+	 * the point where the right bit sending loop begins. */
+	uint32_t instr;
+	if (word_size == 16) {
+		instr = pio_encode_jmp(sm_offset + PIO_I2S_TX_PROGRAM_RIGHT_ENTRY_POINT);
+	}
+	else {
+		instr = pio_encode_jmp(sm_offset);
+	}
+	pio_sm_exec(pio, sm, instr);
 }
 
 static int i2s_rpi_pico_initialize(const struct device *dev)
@@ -206,36 +210,36 @@ static int i2s_rpi_pico_initialize(const struct device *dev)
 
 	ret = pio_rpi_pico_allocate_sm(dev_cfg->piodev, &dev_data->tx.sm);
 	if (ret < 0) {
-		LOG_ERR("pio_rpi_pico_allocate_sm() failed: %d", ret);
+		LOG_ERR("pio_rpi_pico_allocate_sm() for TX SM failed: %d", ret);
 		return ret;
 	}
 
 	dev_data->tx.dma_cfg.user_data = (void *)dev;
 	dev_data->tx.dma_cfg.dma_slot = RPI_PICO_DMA_DREQ_TO_SLOT(pio_get_dreq(pio, dev_data->tx.sm, true));
 
-	ret = pio_i2s_tx_init(pio, dev_data->tx.sm, dev_cfg->data_pin, dev_cfg->clock_pin_base);
+	ret = pio_i2s_tx_init(pio, dev_data->tx.sm, &dev_data->tx.sm_offset, dev_cfg->data_pin, dev_cfg->clk_pin_base);
 	if (ret < 0) {
 		LOG_ERR("pio_i2s_tx_init() failed: %d", ret);
 		return ret;
 	}
 
-	ret = pio_rpi_pico_allocate_sm(dev_cfg->piodev, &dev_data->tx.mclk_sm);
+	ret = pio_rpi_pico_allocate_sm(dev_cfg->piodev, &dev_data->mclk_sm);
 	if (ret < 0) {
-		LOG_ERR("pio_rpi_pico_allocate_sm() failed: %d", ret); // TODO better log
+		LOG_ERR("pio_rpi_pico_allocate_sm() for MCLK SM failed: %d", ret);
 		return ret;
 	}
 
-	ret = pio_i2s_mclk_init(pio, dev_data->tx.mclk_sm, dev_cfg->mclk_pin);
+	ret = pio_i2s_mclk_init(pio, dev_data->mclk_sm, dev_cfg->mclk_pin);
 	if (ret < 0) {
 		LOG_ERR("pio_i2s_mclk_init() failed: %d", ret);
 		return ret;
 	}
 
-	ret = pinctrl_apply_state(dev_cfg->pcfg, PINCTRL_STATE_DEFAULT);
-	if (ret < 0) {
-		LOG_ERR("pinctrl_apply_state() failed: %d", ret);
-		return ret;
-	}
+	// ret = pinctrl_apply_state(dev_cfg->pcfg, PINCTRL_STATE_DEFAULT); // TODO this causes some issues with pio_gpio_init, fix this
+	// if (ret < 0) {
+	// 	LOG_ERR("pinctrl_apply_state() failed: %d", ret);
+	// 	return ret;
+	// }
 
 	ret = dma_config(dev_data->tx.dev_dma, dev_data->tx.dma_channel, &dev_data->tx.dma_cfg);
 	if (ret < 0) {
@@ -305,7 +309,7 @@ static int tx_stream_start(const struct device *dev)
 	}
 
 	// pio_sm_set_enabled(pio, strm->sm, true);
-	pio_enable_sm_mask_in_sync(pio, (1U << strm->sm) | (1U << strm->mclk_sm));
+	pio_enable_sm_mask_in_sync(pio, (1 << strm->sm) | (1 << dev_data->mclk_sm));
 
 	return 0;
 }
@@ -326,7 +330,7 @@ static void tx_stream_disable(const struct device *dev)
 
 	pio = pio_rpi_pico_get_pio(dev_cfg->piodev);
 	pio_sm_set_enabled(pio, strm->sm, false);
-	pio_sm_set_enabled(pio, strm->mclk_sm, false);
+	pio_sm_set_enabled(pio, dev_data->mclk_sm, false);
 }
 
 static void i2s_dma_tx_callback(const struct device *dma_dev, void *arg, uint32_t channel, int status)
@@ -448,12 +452,13 @@ static int i2s_rpi_pico_config(const struct device *dev, enum i2s_dir dir, const
 	}
 
 	pio = pio_rpi_pico_get_pio(dev_cfg->piodev);
-	// pio_i2s_set_bclk(pio, strm->sm, &strm->i2s_cfg);
-	if (pio_i2s_set_clocks(pio, strm->mclk_sm, strm->sm, &strm->i2s_cfg) != 0) {
+	if (pio_i2s_set_clocks(pio, dev_data->mclk_sm, strm->sm, &strm->i2s_cfg) != 0) {
 		LOG_ERR("Invalid config!");
 		return -EINVAL; // TODO
 	}
-	pio_i2s_tx_set_word_size(pio, strm->sm, strm->i2s_cfg.word_size);
+	pio_sm_clear_fifos(pio, strm->sm);
+	pio_sm_restart(pio, strm->sm);
+	pio_i2s_tx_set_word_size(pio, strm->sm, strm->sm_offset, strm->i2s_cfg.word_size);
 
 	strm->state = I2S_STATE_READY;
 
@@ -572,7 +577,6 @@ static int i2s_rpi_pico_trigger(const struct device *dev, enum i2s_dir dir, enum
 		break;
 	}
 
-
 	irq_unlock(key);
 
 	return ret;
@@ -592,7 +596,7 @@ static DEVICE_API(i2s, i2s_rpi_pico_driver_api) = {
 	static const struct i2s_dev_config i2s##inst##_dev_config = {					\
 		.piodev = DEVICE_DT_GET(DT_INST_PARENT(inst)),						\
 		.pcfg = PINCTRL_DT_INST_DEV_CONFIG_GET(inst),						\
-		.clock_pin_base = DT_INST_RPI_PICO_PIO_PIN_BY_NAME(inst, default, 0, tx_pins, 0),	\
+		.clk_pin_base = DT_INST_RPI_PICO_PIO_PIN_BY_NAME(inst, default, 0, tx_pins, 0),		\
 		.data_pin = DT_INST_RPI_PICO_PIO_PIN_BY_NAME(inst, default, 0, tx_pins, 1),		\
 		.mclk_pin = 15 /* TODO configurable */							\
 	};												\
@@ -612,8 +616,8 @@ static DEVICE_API(i2s, i2s_rpi_pico_driver_api) = {
 				.block_count = 1,							\
 				.head_block = &i2s##inst##_dev_data.tx.dma_block_cfg,			\
 				.channel_direction = MEMORY_TO_PERIPHERAL,				\
-				.source_data_size = 4,  /* TODO configurable */				\
-				.dest_data_size = 4,    /* TODO configurable */				\
+				.source_data_size = 4,  						\
+				.dest_data_size = 4,    						\
 			},										\
 		},											\
 	};												\
