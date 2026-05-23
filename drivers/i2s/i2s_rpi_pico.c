@@ -17,6 +17,9 @@
 
 #define I2S_MCLK_TO_FS_RATIO 256
 
+#define PIO_CLKDIV_FRAC_BITS 8
+#define PIO_CLKDIV_FRAC_BASE (1 << PIO_CLKDIV_FRAC_BITS)
+
 LOG_MODULE_REGISTER(i2s_rpi_pico, CONFIG_I2S_LOG_LEVEL);
 
 // RPI_PICO_PIO_DEFINE_PROGRAM(i2s_mclk, 0, 1,
@@ -26,34 +29,45 @@ LOG_MODULE_REGISTER(i2s_rpi_pico, CONFIG_I2S_LOG_LEVEL);
 // 		//     .wrap
 // );
 
+/* NOTE:
+ * Fail mode for this separate clock generator solution is
+ * rather unacceptable, as we might end up with swapped
+ * channels after buffer underrun. A better idea would be
+ * to have clock as sideset for both Tx and Rx on the same
+ * pins and just enable those as outputs for a single SM
+ * in case full duplex is needed. No idea how to support
+ * slave mode then, though. */
+
 RPI_PICO_PIO_DEFINE_PROGRAM(i2s_bclk, 0, 7,
-            //     .wrap_target
-    0xa022, //  0: mov    x, y            side 0
-    0xa842, //  1: nop                    side 1
-    0x0041, //  2: jmp    x--, 1          side 0
-    0xa842, //  3: nop                    side 1
-    0xb022, //  4: mov    x, y            side 2
-    0xb842, //  5: nop                    side 3
-    0x1045, //  6: jmp    x--, 5          side 2
-    0xb842, //  7: nop                    side 3
-            //     .wrap
+				//     .wrap_target
+		0xa022, //  0: mov    x, y            side 0     
+		0xa842, //  1: nop                    side 1     
+		0x0041, //  2: jmp    x--, 1          side 0     
+		0xa842, //  3: nop                    side 1     
+		0xb022, //  4: mov    x, y            side 2     
+		0xb842, //  5: nop                    side 3     
+		0x1045, //  6: jmp    x--, 5          side 2     
+		0xb842, //  7: nop                    side 3     
+				//     .wrap
 );
 
-RPI_PICO_PIO_DEFINE_PROGRAM(i2s_tx, 0, 12,
+
+RPI_PICO_PIO_DEFINE_PROGRAM(i2s_tx, 0, 13,
             //     .wrap_target
-    0x8080, //  0: pull   noblock
-    0x2021, //  1: wait   0 pin, 1
-    0xa022, //  2: mov    x, y
-    0x20a0, //  3: wait   1 pin, 0
-    0x2020, //  4: wait   0 pin, 0
-    0x6001, //  5: out    pins, 1
-    0x0043, //  6: jmp    x--, 3
-    0x8080, //  7: pull   noblock
-    0xa022, //  8: mov    x, y
-    0x20a0, //  9: wait   1 pin, 0
-    0x2020, // 10: wait   0 pin, 0
-    0x6001, // 11: out    pins, 1
-    0x0049, // 12: jmp    x--, 9
+    0x8080, //  0: pull   noblock                    
+    0x2021, //  1: wait   0 pin, 1                   
+    0xa022, //  2: mov    x, y                       
+    0x20a0, //  3: wait   1 pin, 0                   
+    0x2020, //  4: wait   0 pin, 0                   
+    0x6001, //  5: out    pins, 1                    
+    0x0043, //  6: jmp    x--, 3                     
+    0x8080, //  0: pull   noblock                     
+    0x20a1, //  8: wait   1 pin, 1    // TODO not needed probably               
+    0xa022, //  9: mov    x, y                       
+    0x20a0, // 10: wait   1 pin, 0                   
+    0x2020, // 11: wait   0 pin, 0                   
+    0x6001, // 12: out    pins, 1                    
+    0x004a, // 13: jmp    x--, 10                    
             //     .wrap
 );
 
@@ -103,13 +117,32 @@ static void stream_queue_drop(struct stream *strm)
 	}
 }
 
-static void pio_i2s_set_bclk(PIO pio, uint8_t sm, struct i2s_config *cfg) // TODO this is just temporary
+static int pio_i2s_set_clocks(PIO pio, uint32_t mclk_sm, uint32_t bclk_sm, uint32_t tx_sm, struct i2s_config *cfg)
 {
-	const uint32_t sysclk_freq = clock_get_hz(clk_sys);
-	const uint32_t bclk_freq = cfg->frame_clk_freq * cfg->channels * cfg->word_size;
-	const uint32_t divider = 256ULL * sysclk_freq / (2ULL * bclk_freq); // TODO magic numbers
+	const uint32_t mclk_sm_freq = 2U * I2S_MCLK_TO_FS_RATIO * cfg->frame_clk_freq;
+	const uint32_t bclk_sm_freq = 2U * cfg->frame_clk_freq * cfg->channels * cfg->word_size;
+	LOG_DBG("mclk_sm_freq: %" PRIu32 "Hz", mclk_sm_freq);
+	LOG_DBG("bclk_sm_freq: %" PRIu32 "Hz", bclk_sm_freq);
 
-	pio_sm_set_clkdiv_int_frac(pio, sm, divider >> 8U, divider & 0xFFU);
+	/* Compute MCLK SM divider in 16.8 */
+	const uint64_t sysclk_freq = clock_get_hz(clk_sys);
+	const uint32_t mclk_div_q = DIV_ROUND_CLOSEST(PIO_CLKDIV_FRAC_BASE * sysclk_freq, mclk_sm_freq);
+	LOG_DBG("mclk_div_q: %" PRIu32, mclk_div_q);
+
+	/* Compute BCLK SM divider using BCLK to MCLK ratio */
+	const uint32_t bclk_div_q = (uint32_t)((uint64_t)mclk_div_q * mclk_sm_freq / bclk_sm_freq);
+	LOG_DBG("bclk_div_q: %" PRIu32, bclk_div_q);
+
+	/* Check if the ratio is exact */
+	if ((mclk_div_q * I2S_MCLK_TO_FS_RATIO) != (bclk_div_q * cfg->channels * cfg->word_size)) {
+		return -ENOTSUP;
+	}
+
+	/* Set clocks */
+	pio_sm_set_clkdiv_int_frac(pio, bclk_sm, bclk_div_q >> 8, bclk_div_q & 0xFF);
+	// TODO MCLK
+
+	return 0;
 }
 
 static int pio_i2s_bclk_init(PIO pio, uint32_t sm, uint32_t clk_pin_base)
@@ -132,8 +165,8 @@ static int pio_i2s_bclk_init(PIO pio, uint32_t sm, uint32_t clk_pin_base)
 	sm_config_set_wrap(&cfg, 
 				offset + RPI_PICO_PIO_GET_WRAP_TARGET(i2s_bclk),
 				offset + RPI_PICO_PIO_GET_WRAP(i2s_bclk));
-	pio_sm_set_consecutive_pindirs(pio, sm, clk_pin_base, 2, true);
 	pio_sm_init(pio, sm, offset, &cfg);
+	pio_sm_set_consecutive_pindirs(pio, sm, clk_pin_base, 2, true);
 
 	return 0;
 }
@@ -161,9 +194,8 @@ static int pio_i2s_tx_init(PIO pio, uint32_t sm, uint32_t data_pin, uint32_t clk
 	sm_config_set_out_shift(&cfg, false, false, 0);
 	sm_config_set_out_pins(&cfg, data_pin, 1);
 	sm_config_set_in_pins(&cfg, clk_pin_base);
-	sm_config_set_jmp_pin(&cfg, clk_pin_base + 1);
 	sm_config_set_wrap(&cfg,
-				offset + RPI_PICO_PIO_GET_WRAP_TARGET(i2s_tx), // TODO this should be changed based on 16/32-bit (if the idea works at all)
+				offset + RPI_PICO_PIO_GET_WRAP_TARGET(i2s_tx) + 1, // TODO this should be changed based on 16/32-bit (if the idea works at all)
 				offset + RPI_PICO_PIO_GET_WRAP(i2s_tx));
 	sm_config_set_fifo_join(&cfg, PIO_FIFO_JOIN_TX);
 	pio_sm_init(pio, sm, offset, &cfg);
@@ -214,7 +246,7 @@ static int i2s_rpi_pico_initialize(const struct device *dev)
 		return ret;
 	}
 
-	// ret = pio_i2s_mclk_init(pio, dev_data->tx.mclk_sm, dev_cfg->mclk_pin);
+	// ret = pio_i2s_mclk_init(pio, dev_data->tx.mclk_sm, dev_cfg->mclk_pin); // TODO enable this
 	// if (ret < 0) {
 	// 	LOG_ERR("pio_i2s_mclk_init() failed: %d", ret);
 	// 	return ret;
@@ -226,11 +258,11 @@ static int i2s_rpi_pico_initialize(const struct device *dev)
 	// 	return ret;
 	// }
 
-	ret = dma_config(dev_data->tx.dev_dma, dev_data->tx.dma_channel, &dev_data->tx.dma_cfg);
-	if (ret < 0) {
-		LOG_ERR("dma_config() failed: %d", ret);
-		return ret;
-	}
+	// ret = dma_config(dev_data->tx.dev_dma, dev_data->tx.dma_channel, &dev_data->tx.dma_cfg);
+	// if (ret < 0) {
+	// 	LOG_ERR("dma_config() failed: %d", ret);
+	// 	return ret;
+	// }
 
 	return 0;
 }
@@ -293,7 +325,7 @@ static int tx_stream_start(const struct device *dev)
 		return ret;
 	}
 
-	// pio_enable_sm_mask_in_sync(pio, (1U << strm->sm) | (1U << strm->mclk_sm));
+	// pio_enable_sm_mask_in_sync(pio, (1U << strm->sm) | (1U << strm->mclk_sm)); // TODO MCLK
 	pio_enable_sm_mask_in_sync(pio, (1U << strm->sm) | (1U << dev_data->bclk_sm));
 
 	return 0;
@@ -327,6 +359,8 @@ static void i2s_dma_tx_callback(const struct device *dma_dev, void *arg, uint32_
 	struct i2s_q_item block;
 	int ret;
 	PIO pio;
+
+	uint32_t t_start = k_cycle_get_32();
 
 	/* Stop if DMA error */
 	if (status < 0) {
@@ -373,12 +407,30 @@ static void i2s_dma_tx_callback(const struct device *dma_dev, void *arg, uint32_
 	strm->mem_block = block.mem_block;
 	pio = pio_rpi_pico_get_pio(dev_cfg->piodev);
 
+	int lvl = pio_sm_get_tx_fifo_level(pio, strm->sm);
+	if (lvl < 4) {
+		printk("FIFO low: %d\n", lvl);
+	}
+
+	/* NOTE:
+	 * The need to restart the DMA every time is a severe limitation that basically
+	 * makes this implementation useless. Even with the PIO TX FIFO joined, we get 8 words
+	 * of space; for 2 channels, 32-bit word size and 48kHz SR this gives (8/2)/48000Hz = ~83us
+	 * to start a new transfer before the FIFO drains. This is already VERY tight and WILL result 
+	 * in underruns, and that's not even a particularly demanding config.
+	 * Doing this properly will require implementing circular DMA mode with IRQ every half 
+	 * completion, but currently Zephyr DMA for RP2040 does not support it. */
+
 	/* Start next DMA transfer */
 	ret = reload_dma(strm, block.mem_block, (void *)&pio->txf[strm->sm], block.size);
 	if (ret < 0) {
 		LOG_ERR("reload_dma() failed: %d", ret);
 		tx_stream_disable(dev);
 	}
+
+	uint32_t t_end = k_cycle_get_32();
+
+	LOG_DBG("ISR time: %uus", (t_end - t_start) / 125);
 }
 
 static int i2s_rpi_pico_config(const struct device *dev, enum i2s_dir dir, const struct i2s_config *i2s_cfg)
@@ -437,11 +489,10 @@ static int i2s_rpi_pico_config(const struct device *dev, enum i2s_dir dir, const
 	}
 
 	pio = pio_rpi_pico_get_pio(dev_cfg->piodev);
-	pio_i2s_set_bclk(pio, dev_data->bclk_sm, &strm->i2s_cfg);
-	// if (pio_i2s_set_clocks(pio, strm->mclk_sm, strm->sm, &strm->i2s_cfg) != 0) {
-	// 	LOG_ERR("Invalid config!");
-	// 	return -EINVAL; // TODO
-	// }
+	if (pio_i2s_set_clocks(pio, dev_data->mclk_sm, dev_data->bclk_sm, strm->sm, &strm->i2s_cfg) != 0) {
+		LOG_ERR("Invalid config!");
+		return -EINVAL; // TODO
+	}
 	pio_i2s_set_word_size(pio, strm->sm, strm->i2s_cfg.word_size + 1); // TODO
 	pio_i2s_set_word_size(pio, dev_data->bclk_sm, strm->i2s_cfg.word_size);
 
@@ -579,7 +630,7 @@ static DEVICE_API(i2s, i2s_rpi_pico_driver_api) = {
 #define I2S_RPI_PICO_INIT(inst)										\
 	PINCTRL_DT_INST_DEFINE(inst);									\
 													\
-	static const struct i2s_dev_config i2s##inst##_dev_config = {					\
+	const struct i2s_dev_config i2s##inst##_dev_config = {					\
 		.piodev = DEVICE_DT_GET(DT_INST_PARENT(inst)),						\
 		.pcfg = PINCTRL_DT_INST_DEV_CONFIG_GET(inst),						\
 		.clk_pin_base = DT_INST_RPI_PICO_PIO_PIN_BY_NAME(inst, default, 0, tx_pins, 0),		\
@@ -590,7 +641,7 @@ static DEVICE_API(i2s, i2s_rpi_pico_driver_api) = {
 	K_MSGQ_DEFINE(i2s##inst##_tx_queue, sizeof(struct i2s_q_item),					\
 			CONFIG_I2S_RX_BLOCK_COUNT, 4);							\
 													\
-	static struct i2s_dev_data i2s##inst##_dev_data = {						\
+	struct i2s_dev_data i2s##inst##_dev_data = {						\
 		.tx = {											\
 			.msgq = &i2s##inst##_tx_queue,							\
 			.dev_dma = DEVICE_DT_GET(DT_INST_DMAS_CTLR_BY_NAME(inst, tx)),			\
@@ -604,6 +655,7 @@ static DEVICE_API(i2s, i2s_rpi_pico_driver_api) = {
 				.channel_direction = MEMORY_TO_PERIPHERAL,				\
 				.source_data_size = 4,  /* TODO configurable */				\
 				.dest_data_size = 4,    /* TODO configurable */				\
+				.channel_priority = 1 \
 			},										\
 		},											\
 	};												\
